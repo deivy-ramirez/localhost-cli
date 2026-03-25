@@ -2,208 +2,74 @@
 
 set -euo pipefail
 
-show_help() {
-  cat <<'EOF'
-localhost - Vista local de un dominio apuntando a una IP específica
+HOSTS_FILE="/etc/hosts"
 
-Uso:
-  localhost dominio.com 1.2.3.4 [puerto]
-
-Ejemplos:
-  localhost ejemplo.com 203.0.113.10
-  localhost ejemplo.com 203.0.113.10 9090
-
-Qué hace:
-  - Levanta un proxy local en 127.0.0.1:PUERTO
-  - Reenvía las peticiones a la IP indicada
-  - Envía el Host correcto del dominio
-  - Te permite abrir la web localmente en el navegador
-
-Notas:
-  - Algunas webs con redirecciones absolutas pueden salir del localhost
-  - No reemplaza completamente editar /etc/hosts
-  - Requiere python3
-EOF
+flush_dns() {
+  sudo dscacheutil -flushcache 2>/dev/null || true
+  sudo killall -HUP mDNSResponder 2>/dev/null || true
 }
 
-cleanup() {
-  [[ -n "${PY_FILE:-}" && -f "${PY_FILE:-}" ]] && rm -f "$PY_FILE"
+add_host() {
+  local domain="$1"
+  local ip="$2"
+
+  echo "Agregando entrada en /etc/hosts..."
+  echo "$ip $domain" | sudo tee -a "$HOSTS_FILE" > /dev/null
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  show_help
-  exit 0
-fi
+remove_host() {
+  local domain="$1"
 
-DOMAIN="${1:-}"
-TARGET_IP="${2:-}"
-PORT="${3:-8080}"
+  echo "Eliminando entrada de $domain..."
+  sudo sed -i '' "/$domain/d" "$HOSTS_FILE"
+}
 
-if [[ -z "$DOMAIN" || -z "$TARGET_IP" ]]; then
-  show_help
+open_browser() {
+  local domain="$1"
+  echo "Abriendo navegador..."
+  open "https://$domain" 2>/dev/null || true
+}
+
+echo "======================================="
+echo "           LOCALHOST TOOL              "
+echo "======================================="
+echo ""
+
+# 🔹 Pedir datos
+read -rp "Dominio: " DOMAIN
+read -rp "IP: " IP
+
+if [[ -z "$DOMAIN" || -z "$IP" ]]; then
+  echo "Error: dominio e IP son obligatorios"
   exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Error: python3 no está instalado o no está en el PATH."
-  exit 1
-fi
+echo ""
+echo "Configurando entorno..."
 
-if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
-  echo "Error: puerto inválido: $PORT"
-  exit 1
-fi
+add_host "$DOMAIN" "$IP"
+flush_dns
 
-PY_FILE="/tmp/localhost_proxy_${PORT}_$$.py"
-trap cleanup EXIT
+echo ""
+echo "✔ Dominio configurado:"
+echo "   https://$DOMAIN"
+echo ""
 
-cat > "$PY_FILE" <<'PYEOF'
-#!/usr/bin/env python3
-import http.client
-import ssl
-import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+open_browser "$DOMAIN"
 
-if len(sys.argv) < 4:
-    print("Uso: local_proxy.py dominio ip puerto")
-    sys.exit(1)
+echo ""
+echo "Puedes navegar normalmente en el navegador."
+echo ""
 
-DOMAIN = sys.argv[1]
-TARGET_IP = sys.argv[2]
-PORT = int(sys.argv[3])
+# 🔹 Esperar al usuario
+read -rp "Presiona ENTER cuando quieras revertir los cambios..."
 
-USE_HTTPS_TO_TARGET = True
-TIMEOUT = 30
+echo ""
+echo "Revirtiendo cambios..."
 
-HOP_BY_HOP_HEADERS = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-}
+remove_host "$DOMAIN"
+flush_dns
 
-class ProxyHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def _read_body(self):
-        length = self.headers.get("Content-Length")
-        if length is None:
-            return None
-        try:
-            size = int(length)
-        except ValueError:
-            return None
-        return self.rfile.read(size) if size > 0 else b""
-
-    def _forward(self):
-        body = self._read_body()
-
-        path = self.path
-        if path.startswith("http://") or path.startswith("https://"):
-            parsed = urlsplit(path)
-            path = parsed.path or "/"
-            if parsed.query:
-                path += "?" + parsed.query
-
-        outgoing_headers = {}
-        for k, v in self.headers.items():
-            if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() != "host":
-                outgoing_headers[k] = v
-
-        outgoing_headers["Host"] = DOMAIN
-
-        try:
-            if USE_HTTPS_TO_TARGET:
-                context = ssl._create_unverified_context()
-                conn = http.client.HTTPSConnection(
-                    TARGET_IP, 443, timeout=TIMEOUT, context=context
-                )
-            else:
-                conn = http.client.HTTPConnection(TARGET_IP, 80, timeout=TIMEOUT)
-
-            conn.request(self.command, path, body=body, headers=outgoing_headers)
-            resp = conn.getresponse()
-            data = resp.read()
-
-            self.send_response(resp.status, resp.reason)
-
-            for k, v in resp.getheaders():
-                kl = k.lower()
-                if kl in HOP_BY_HOP_HEADERS:
-                    continue
-                if kl == "content-length":
-                    continue
-                self.send_header(k, v)
-
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-
-            if self.command != "HEAD":
-                self.wfile.write(data)
-
-            conn.close()
-
-        except Exception as e:
-            msg = f"Proxy error: {e}\n".encode("utf-8", errors="replace")
-            self.send_response(502, "Bad Gateway")
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(msg)))
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(msg)
-
-    def do_GET(self):
-        self._forward()
-
-    def do_POST(self):
-        self._forward()
-
-    def do_PUT(self):
-        self._forward()
-
-    def do_DELETE(self):
-        self._forward()
-
-    def do_PATCH(self):
-        self._forward()
-
-    def do_OPTIONS(self):
-        self._forward()
-
-    def do_HEAD(self):
-        self._forward()
-
-    def log_message(self, fmt, *args):
-        sys.stderr.write("[localhost] " + (fmt % args) + "\n")
-
-def main():
-    print(f"Proxy local activo en: http://127.0.0.1:{PORT}")
-    print(f"Dominio simulado      : {DOMAIN}")
-    print(f"IP destino            : {TARGET_IP}")
-    print("")
-    print("Abre esa URL en tu navegador.")
-    print("Presiona Ctrl+C para detenerlo.")
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), ProxyHandler)
-    try:
-      server.serve_forever()
-    except KeyboardInterrupt:
-      pass
-    finally:
-      server.server_close()
-
-if __name__ == "__main__":
-    main()
-PYEOF
-
-chmod +x "$PY_FILE"
-
-echo "Iniciando localhost..."
-echo "URL local: http://127.0.0.1:${PORT}"
-echo
-
-exec python3 "$PY_FILE" "$DOMAIN" "$TARGET_IP" "$PORT"
+echo ""
+echo "✔ Todo restaurado correctamente"
+echo ""
