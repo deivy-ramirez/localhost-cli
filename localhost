@@ -2,74 +2,386 @@
 
 set -euo pipefail
 
-HOSTS_FILE="/etc/hosts"
+show_help() {
+  cat <<'EOF'
+localhost - Visualiza un dominio apuntando a una IP específica desde un proxy local
 
-flush_dns() {
-  sudo dscacheutil -flushcache 2>/dev/null || true
-  sudo killall -HUP mDNSResponder 2>/dev/null || true
+Uso:
+  localhost
+  localhost dominio.com 1.2.3.4
+  localhost dominio.com 1.2.3.4 8080
+
+Descripción:
+  Levanta un proxy local en 127.0.0.1:PUERTO y reenvía las peticiones
+  hacia la IP indicada usando el Host original del dominio.
+
+Ejemplos:
+  localhost
+  localhost ejemplo.com 203.0.113.10
+  localhost ejemplo.com 203.0.113.10 9090
+
+Notas:
+  - No reemplaza completamente /etc/hosts
+  - Algunas apps modernas con JS pesado, APIs externas, cookies estrictas,
+    WebSockets, Cloudflare o CSP agresiva pueden no funcionar igual
+EOF
 }
 
-add_host() {
-  local domain="$1"
-  local ip="$2"
-
-  echo "Agregando entrada en /etc/hosts..."
-  echo "$ip $domain" | sudo tee -a "$HOSTS_FILE" > /dev/null
+cleanup() {
+  [[ -n "${PY_FILE:-}" && -f "${PY_FILE:-}" ]] && rm -f "$PY_FILE"
 }
 
-remove_host() {
-  local domain="$1"
+is_valid_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+}
 
-  echo "Eliminando entrada de $domain..."
-  sudo sed -i '' "/$domain/d" "$HOSTS_FILE"
+can_bind_port() {
+  local port="$1"
+  python3 - <<PY >/dev/null 2>&1
+import socket
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int("$port")))
+    s.close()
+    raise SystemExit(0)
+except OSError:
+    raise SystemExit(1)
+PY
+}
+
+pick_port() {
+  local preferred="$1"
+  if can_bind_port "$preferred"; then
+    echo "$preferred"
+    return 0
+  fi
+
+  local p
+  for p in 8080 8081 8082 8083 8090 9000 3000 5000; do
+    if can_bind_port "$p"; then
+      echo "$p"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 open_browser() {
-  local domain="$1"
-  echo "Abriendo navegador..."
-  open "https://$domain" 2>/dev/null || true
+  local url="$1"
+
+  if command -v open >/dev/null 2>&1; then
+    open "$url" >/dev/null 2>&1 &
+    return 0
+  fi
+
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 &
+    return 0
+  fi
+
+  return 1
 }
 
-echo "======================================="
-echo "           LOCALHOST TOOL              "
-echo "======================================="
-echo ""
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  show_help
+  exit 0
+fi
 
-# 🔹 Pedir datos
-read -rp "Dominio: " DOMAIN
-read -rp "IP: " IP
+DOMAIN="${1:-}"
+TARGET_IP="${2:-}"
+PORT="${3:-8080}"
 
-if [[ -z "$DOMAIN" || -z "$IP" ]]; then
-  echo "Error: dominio e IP son obligatorios"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: python3 no está instalado o no está en el PATH."
   exit 1
 fi
 
-echo ""
-echo "Configurando entorno..."
+if [[ -z "$DOMAIN" ]]; then
+  read -r -p "Dominio: " DOMAIN
+fi
 
-add_host "$DOMAIN" "$IP"
-flush_dns
+if [[ -z "$TARGET_IP" ]]; then
+  read -r -p "IP destino: " TARGET_IP
+fi
 
-echo ""
-echo "✔ Dominio configurado:"
-echo "   https://$DOMAIN"
-echo ""
+if [[ -z "${3:-}" ]]; then
+  read -r -p "Puerto local [8080]: " INPUT_PORT || true
+  PORT="${INPUT_PORT:-8080}"
+fi
 
-open_browser "$DOMAIN"
+if [[ -z "$DOMAIN" || -z "$TARGET_IP" ]]; then
+  echo "Error: dominio e IP son obligatorios."
+  echo
+  show_help
+  exit 1
+fi
 
-echo ""
-echo "Puedes navegar normalmente en el navegador."
-echo ""
+if ! is_valid_port "$PORT"; then
+  echo "Error: puerto inválido: $PORT"
+  exit 1
+fi
 
-# 🔹 Esperar al usuario
-read -rp "Presiona ENTER cuando quieras revertir los cambios..."
+SELECTED_PORT="$(pick_port "$PORT")" || {
+  echo "Error: no encontré un puerto local libre."
+  exit 1
+}
 
-echo ""
-echo "Revirtiendo cambios..."
+if [[ "$SELECTED_PORT" != "$PORT" ]]; then
+  echo "Aviso: el puerto $PORT está ocupado. Usaré $SELECTED_PORT."
+  PORT="$SELECTED_PORT"
+fi
 
-remove_host "$DOMAIN"
-flush_dns
+PY_FILE="/tmp/localhost_proxy_${PORT}_$$.py"
+trap cleanup EXIT
 
-echo ""
-echo "✔ Todo restaurado correctamente"
-echo ""
+cat > "$PY_FILE" <<'PYEOF'
+#!/usr/bin/env python3
+import gzip
+import http.client
+import re
+import ssl
+import sys
+import zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+if len(sys.argv) < 4:
+    print("Uso: local_proxy.py dominio ip puerto")
+    sys.exit(1)
+
+DOMAIN = sys.argv[1]
+TARGET_IP = sys.argv[2]
+PORT = int(sys.argv[3])
+TIMEOUT = 30
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+
+LOCAL_HTTP = f"http://127.0.0.1:{PORT}"
+LOCAL_HTTPS = f"https://127.0.0.1:{PORT}"
+
+def decode_body(data: bytes, encoding: str) -> bytes:
+    enc = (encoding or "").lower().strip()
+    try:
+        if enc == "gzip":
+            return gzip.decompress(data)
+        if enc == "deflate":
+            return zlib.decompress(data)
+    except Exception:
+        return data
+    return data
+
+def rewrite_text(content: str) -> str:
+    replacements = [
+        (f"https://{DOMAIN}", LOCAL_HTTP),
+        (f"http://{DOMAIN}", LOCAL_HTTP),
+        (f"//{DOMAIN}", f"//127.0.0.1:{PORT}"),
+        (DOMAIN, f"127.0.0.1:{PORT}"),
+    ]
+    for old, new in replacements:
+        content = content.replace(old, new)
+
+    content = re.sub(
+        r'(["\'])/(?!/)',
+        rf'\1{LOCAL_HTTP}/',
+        content
+    )
+    return content
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _read_body(self):
+        length = self.headers.get("Content-Length")
+        if length is None:
+            return None
+        try:
+            size = int(length)
+        except ValueError:
+            return None
+        return self.rfile.read(size) if size > 0 else b""
+
+    def _normalize_path(self):
+        path = self.path
+        if path.startswith("http://") or path.startswith("https://"):
+            parsed = urlsplit(path)
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
+        return path
+
+    def _build_headers(self):
+        outgoing = {}
+        for k, v in self.headers.items():
+            kl = k.lower()
+            if kl in HOP_BY_HOP_HEADERS:
+                continue
+            if kl == "host":
+                continue
+            if kl == "accept-encoding":
+                continue
+            outgoing[k] = v
+
+        outgoing["Host"] = DOMAIN
+        outgoing["Accept-Encoding"] = "identity"
+        return outgoing
+
+    def _send_error(self, msg: str):
+        raw = msg.encode("utf-8", errors="replace")
+        self.send_response(502, "Bad Gateway")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(raw)
+
+    def _rewrite_location(self, value: str) -> str:
+        value = value.replace(f"https://{DOMAIN}", LOCAL_HTTP)
+        value = value.replace(f"http://{DOMAIN}", LOCAL_HTTP)
+        value = value.replace(f"//{DOMAIN}", f"//127.0.0.1:{PORT}")
+        return value
+
+    def _forward(self):
+        body = self._read_body()
+        path = self._normalize_path()
+        outgoing_headers = self._build_headers()
+
+        try:
+            context = ssl._create_unverified_context()
+            conn = http.client.HTTPSConnection(
+                TARGET_IP, 443, timeout=TIMEOUT, context=context
+            )
+
+            conn.request(self.command, path, body=body, headers=outgoing_headers)
+            resp = conn.getresponse()
+            raw_data = resp.read()
+
+            status = resp.status
+            reason = resp.reason
+            response_headers = resp.getheaders()
+
+            header_map = {}
+            for k, v in response_headers:
+                header_map.setdefault(k.lower(), []).append(v)
+
+            content_type = header_map.get("content-type", [""])[0]
+            content_encoding = header_map.get("content-encoding", [""])[0]
+
+            data = decode_body(raw_data, content_encoding)
+
+            should_rewrite = any(t in content_type.lower() for t in [
+                "text/html",
+                "application/xhtml+xml",
+                "text/css",
+                "application/javascript",
+                "text/javascript",
+                "application/json",
+            ])
+
+            if should_rewrite:
+                try:
+                    text = data.decode("utf-8", errors="ignore")
+                    text = rewrite_text(text)
+                    data = text.encode("utf-8")
+                    content_encoding = ""
+                except Exception:
+                    pass
+
+            self.send_response(status, reason)
+
+            for k, v in response_headers:
+                kl = k.lower()
+
+                if kl in HOP_BY_HOP_HEADERS:
+                    continue
+                if kl == "content-length":
+                    continue
+                if kl == "content-encoding" and not content_encoding:
+                    continue
+                if kl == "location":
+                    v = self._rewrite_location(v)
+
+                self.send_header(k, v)
+
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+
+            if self.command != "HEAD":
+                self.wfile.write(data)
+
+            conn.close()
+
+        except Exception as e:
+            self._send_error(f"Proxy error: {e}\n")
+
+    def do_GET(self):
+        self._forward()
+
+    def do_POST(self):
+        self._forward()
+
+    def do_PUT(self):
+        self._forward()
+
+    def do_DELETE(self):
+        self._forward()
+
+    def do_PATCH(self):
+        self._forward()
+
+    def do_OPTIONS(self):
+        self._forward()
+
+    def do_HEAD(self):
+        self._forward()
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[localhost] " + (fmt % args) + "\n")
+
+def main():
+    print(f"Proxy mejorado activo en: {LOCAL_HTTP}")
+    print(f"Dominio simulado        : {DOMAIN}")
+    print(f"IP destino              : {TARGET_IP}")
+    print("")
+    print("Abre esa URL en tu navegador.")
+    print("Presiona Ctrl+C para detenerlo.")
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), ProxyHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+chmod +x "$PY_FILE"
+
+URL="http://127.0.0.1:${PORT}"
+
+echo
+echo "Iniciando localhost..."
+echo "Dominio : $DOMAIN"
+echo "IP      : $TARGET_IP"
+echo "Puerto  : $PORT"
+echo "URL     : $URL"
+echo
+
+if open_browser "$URL"; then
+  echo "Se intentó abrir el navegador automáticamente."
+  echo
+fi
+
+exec python3 "$PY_FILE" "$DOMAIN" "$TARGET_IP" "$PORT"
