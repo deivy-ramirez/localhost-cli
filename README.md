@@ -1,12 +1,11 @@
-# 🚀 localhost CLI
+ 🚀 localhost CLI
 
 Herramienta CLI para visualizar un dominio apuntando a una IP específica **sin modificar DNS ni usar `/etc/hosts`**.
 
 Ideal para pruebas de migraciones, debugging web y validaciones rápidas en entornos restringidos (sin acceso root).
 
----
 
-## 🔥 Características
+🔥 Características
 
 - ✔ No requiere permisos `sudo`
 - ✔ No modifica `/etc/hosts`
@@ -17,13 +16,13 @@ Ideal para pruebas de migraciones, debugging web y validaciones rápidas en ento
 - ✔ Apertura automática del navegador
 - ✔ Compatible con macOS y Linux
 
----
 
-## 📦 Instalación
+📦 Instalación
 
-### Método rápido (recomendado)
+Método rápido (recomendado)
 
 bash
+
 curl -s https://raw.githubusercontent.com/TU-USUARIO/localhost-cli/main/install.sh | bash
 
 🧪 Uso
