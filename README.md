@@ -23,7 +23,7 @@ Método rápido (recomendado)
 
 bash
 
-curl -s https://raw.githubusercontent.com/TU-USUARIO/localhost-cli/main/install.sh | bash
+curl -s https://raw.githubusercontent.com/deivy-ramirez/localhost-cli/main/install.sh | bash
 
 🧪 Uso
 🔹 Modo interactivo
